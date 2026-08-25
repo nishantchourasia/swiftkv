@@ -16,3 +16,4 @@ endfunction()
 
 swiftkv_add_test(test_lru)
 swiftkv_add_test(test_store)
+swiftkv_add_test(test_protocol)

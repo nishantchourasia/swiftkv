@@ -45,6 +45,7 @@ find_package(Threads REQUIRED)
 add_library(swiftkv_core
     src/lru.cpp
     src/store.cpp
+    src/protocol.cpp
 )
 target_include_directories(swiftkv_core PUBLIC include)
 target_link_libraries(swiftkv_core PUBLIC Threads::Threads)
