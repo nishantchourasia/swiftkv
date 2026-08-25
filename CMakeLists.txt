@@ -50,6 +50,7 @@ add_library(swiftkv_core
     src/net.cpp
     src/server.cpp
     src/client.cpp
+    src/persistence.cpp
 )
 target_include_directories(swiftkv_core PUBLIC include)
 target_link_libraries(swiftkv_core PUBLIC Threads::Threads)

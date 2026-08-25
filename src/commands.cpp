@@ -59,6 +59,11 @@ CommandResult CommandExecutor::execute(const Command& command) {
         }
         metrics_.bump(metrics_.sets);
         store_.set(args[1], args[2]);
+        // Log before replying, so an "OK" the client received is a write the
+        // log has accepted.
+        if (log_ != nullptr) {
+            log_->append({"SET", args[1], args[2]});
+        }
         return {encode_simple("OK"), Disposition::KeepOpen};
     }
 
@@ -68,12 +73,19 @@ CommandResult CommandExecutor::execute(const Command& command) {
         }
         // DEL takes many keys and returns how many actually existed.
         std::int64_t removed = 0;
+        std::vector<std::string> logged{"DEL"};
         for (std::size_t i = 1; i < args.size(); ++i) {
             if (store_.del(args[i])) {
                 ++removed;
+                logged.push_back(args[i]);
             }
         }
         metrics_.bump(metrics_.deletes, static_cast<std::uint64_t>(removed));
+        // Only keys that actually existed are logged. Recording deletes of
+        // absent keys would grow the log without changing what replay produces.
+        if (log_ != nullptr && removed > 0) {
+            log_->append(logged);
+        }
         return {encode_integer(removed), Disposition::KeepOpen};
     }
 
@@ -103,6 +115,9 @@ CommandResult CommandExecutor::execute(const Command& command) {
             return wrong_arity(verb);
         }
         store_.clear();
+        if (log_ != nullptr) {
+            log_->append({"FLUSHALL"});
+        }
         return {encode_simple("OK"), Disposition::KeepOpen};
     }
 

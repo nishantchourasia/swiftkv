@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 
+#include "swiftkv/persistence.hpp"
 #include "swiftkv/protocol.hpp"
 #include "swiftkv/store.hpp"
 
@@ -57,6 +58,15 @@ public:
     CommandExecutor(Store& store, ServerMetrics& metrics)
         : store_(store), metrics_(metrics) {}
 
+    /// Attach an append-only log. When set, every command that changes the
+    /// keyspace is recorded before the reply is produced, so an acknowledged
+    /// write is one that has reached the log.
+    ///
+    /// Reads are never logged: replaying a GET would change nothing, and
+    /// logging them would multiply the log's size by the read ratio -- here,
+    /// roughly tenfold.
+    void set_log(AppendOnlyLog* log) noexcept { log_ = log; }
+
     /// Execute one parsed command and produce its reply.
     CommandResult execute(const Command& command);
 
@@ -71,6 +81,7 @@ private:
 
     Store& store_;
     ServerMetrics& metrics_;
+    AppendOnlyLog* log_ = nullptr;
 };
 
 }  // namespace swiftkv

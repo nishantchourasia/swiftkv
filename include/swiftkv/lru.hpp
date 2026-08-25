@@ -85,6 +85,17 @@ public:
     /// The least-recently-used key, for tests and introspection.
     [[nodiscard]] std::optional<std::string> lru_key() const;
 
+    /// Visit every entry, most-recently-used first.
+    ///
+    /// Does not change recency: used by log rewriting, which must not disturb
+    /// the eviction order simply by reading everything.
+    template <typename Fn>
+    void for_each(Fn&& fn) const {
+        for (const Entry& entry : entries_) {
+            fn(entry.key, entry.value);
+        }
+    }
+
 private:
     struct Entry {
         std::string key;

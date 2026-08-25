@@ -38,6 +38,35 @@ NetResult Server::start() {
         return NetResult::success();
     }
 
+    // Persistence is set up before the listener binds. Replaying into a store
+    // that is already serving clients would race recovered writes against live
+    // ones, and a recovered value could silently overwrite a newer one.
+    if (!config_.aof_path.empty()) {
+        AppendOnlyLog::Config log_config;
+        log_config.path = config_.aof_path;
+        log_config.sync = config_.aof_sync;
+        log_ = std::make_unique<AppendOnlyLog>(log_config);
+
+        replay_result_ = log_->replay(store_);
+        if (!replay_result_.ok) {
+            // Refuse to start on a corrupt log rather than serving a silently
+            // incomplete dataset. An operator can inspect or move the file.
+            NetResult failure;
+            failure.ok = false;
+            failure.error = EINVAL;
+            failure.message = "append-only log could not be replayed: " + replay_result_.message;
+            log_.reset();
+            return failure;
+        }
+
+        const NetResult opened = log_->open();
+        if (!opened.ok) {
+            log_.reset();
+            return opened;
+        }
+        executor_.set_log(log_.get());
+    }
+
     NetResult result;
     listener_ = listen_on(config_.host, config_.port, config_.backlog, result);
     if (!result.ok) {
@@ -119,6 +148,11 @@ void Server::stop() {
         // Still clear structures in case start() failed part-way through.
         loops_.clear();
         listener_.reset();
+        if (log_) {
+            executor_.set_log(nullptr);
+            log_->close();
+            log_.reset();
+        }
         return;
     }
 
@@ -153,6 +187,15 @@ void Server::stop() {
     }
 
     loops_.clear();
+
+    // Close the log only after every loop has stopped, so no thread can append
+    // to a log that is being torn down. close() flushes and fsyncs, so a clean
+    // shutdown loses nothing regardless of sync policy.
+    if (log_) {
+        executor_.set_log(nullptr);
+        log_->close();
+        log_.reset();
+    }
 }
 
 void Server::wake(Loop& loop) {

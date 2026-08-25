@@ -127,6 +127,25 @@ public:
     /// Number of keys held by one shard, for distribution checks.
     [[nodiscard]] std::size_t shard_size(std::size_t index) const;
 
+    /// Visit every key/value pair in the store.
+    ///
+    /// Locks one shard at a time, so this is **not** a consistent snapshot:
+    /// concurrent writes to an already-visited shard will not be seen. Holding
+    /// every lock at once would give a true snapshot at the cost of stopping
+    /// the entire store, which is unacceptable for the caller this exists for
+    /// (log rewriting) where a slightly stale view is harmless -- the ongoing
+    /// writes are already being appended to the log separately.
+    ///
+    /// `fn` is called while a shard lock is held, so it must not call back into
+    /// the store.
+    template <typename Fn>
+    void for_each(Fn&& fn) const {
+        for (const auto& shard : shards_) {
+            std::lock_guard<std::mutex> lock(shard->mutex);
+            shard->cache.for_each(fn);
+        }
+    }
+
 private:
     /// One shard: a cache and the lock that guards it, alone on a cache line.
     struct alignas(64) Shard {

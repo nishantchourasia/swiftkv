@@ -1,6 +1,8 @@
 #include "swiftkv/server.hpp"
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -8,6 +10,7 @@
 
 #include "catch.hpp"
 #include "swiftkv/client.hpp"
+#include "swiftkv/persistence.hpp"
 
 using namespace swiftkv;
 using namespace std::chrono_literals;
@@ -417,4 +420,138 @@ TEST_CASE("metrics endpoint is Prometheus-shaped", "[server][metrics]") {
 
     REQUIRE(text.find("swiftkv_sets_total 1") != std::string::npos);
     REQUIRE(text.find("swiftkv_connections_accepted_total 1") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Durability -- data must survive a restart
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A unique temporary directory for a log file, cleaned up on scope exit.
+struct TempDir {
+    std::string path;
+
+    TempDir() {
+        static std::atomic<int> counter{0};
+        path = "/tmp/swiftkv-srv-" + std::to_string(::getpid()) + "-" +
+               std::to_string(counter.fetch_add(1));
+        std::filesystem::create_directories(path);
+    }
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    [[nodiscard]] std::string aof() const { return path + "/appendonly.aof"; }
+};
+
+}  // namespace
+
+TEST_CASE("data survives a clean restart", "[server][durability]") {
+    TempDir dir;
+
+    {
+        Server::Config config;
+        config.aof_path = dir.aof();
+        config.aof_sync = AppendOnlyLog::SyncPolicy::Always;
+        TestServer fixture(config);
+        auto client = fixture.connect();
+
+        REQUIRE(client.set("persisted", "value"));
+        REQUIRE(client.set("deleted", "gone"));
+        REQUIRE(client.del("deleted") == 1);
+    }
+
+    Server::Config config;
+    config.aof_path = dir.aof();
+    TestServer fixture(config);
+    auto client = fixture.connect();
+
+    REQUIRE(client.get("persisted") == "value");
+    REQUIRE_FALSE(client.command({"GET", "deleted"})->text == "gone");
+    REQUIRE(fixture.server.replay_result().commands_applied == 3);
+}
+
+TEST_CASE("without a log path nothing is persisted", "[server][durability]") {
+    // The default is a pure cache: no file is written at all.
+    TempDir dir;
+    {
+        TestServer fixture;  // no aof_path
+        auto client = fixture.connect();
+        REQUIRE(client.set("k", "v"));
+        REQUIRE(fixture.server.log() == nullptr);
+    }
+    REQUIRE_FALSE(std::filesystem::exists(dir.aof()));
+}
+
+TEST_CASE("a corrupt log stops the server from starting", "[server][durability]") {
+    // Refusing is safer than serving a silently incomplete dataset; an operator
+    // can then inspect or move the file deliberately.
+    TempDir dir;
+    {
+        std::ofstream out(dir.aof(), std::ios::binary);
+        out << "this is not a valid RESP record\r\n";
+    }
+
+    Server::Config config;
+    config.host = "127.0.0.1";
+    config.port = 0;
+    config.aof_path = dir.aof();
+    Server server(config);
+
+    const auto result = server.start();
+
+    REQUIRE_FALSE(result.ok);
+    REQUIRE(result.message.find("could not be replayed") != std::string::npos);
+}
+
+TEST_CASE("reads are not written to the log", "[server][durability]") {
+    // Logging GETs would multiply the log's size by the read ratio and replay
+    // would be unaffected by them anyway.
+    TempDir dir;
+    Server::Config config;
+    config.aof_path = dir.aof();
+    config.aof_sync = AppendOnlyLog::SyncPolicy::Always;
+    TestServer fixture(config);
+    auto client = fixture.connect();
+
+    client.set("k", "v");
+    const auto after_write = fixture.server.log()->stats().records_appended;
+    for (int i = 0; i < 100; ++i) {
+        client.get("k");
+    }
+
+    REQUIRE(fixture.server.log()->stats().records_appended == after_write);
+}
+
+TEST_CASE("concurrent writes are all durable", "[server][durability]") {
+    TempDir dir;
+    constexpr int kClients = 8;
+    constexpr int kPerClient = 200;
+
+    {
+        Server::Config config;
+        config.aof_path = dir.aof();
+        config.io_threads = 4;
+        TestServer fixture(config);
+
+        std::vector<std::jthread> threads;
+        for (int c = 0; c < kClients; ++c) {
+            threads.emplace_back([&, c] {
+                Client client;
+                if (!client.connect("127.0.0.1", fixture.port(), 10s).ok) {
+                    return;
+                }
+                for (int i = 0; i < kPerClient; ++i) {
+                    client.set("c" + std::to_string(c) + ":" + std::to_string(i), "v");
+                }
+            });
+        }
+    }
+
+    Server::Config config;
+    config.aof_path = dir.aof();
+    TestServer fixture(config);
+
+    REQUIRE(fixture.server.store().size() == kClients * kPerClient);
 }

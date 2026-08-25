@@ -35,6 +35,8 @@ Options:
   --max-connections <n>    Simultaneous clients          (default 10000)
   --idle-timeout <secs>    Close idle clients; 0 = never (default 300)
   --max-value-bytes <n>    Largest accepted argument     (default 8388608)
+  --aof <path>             Append-only log; enables persistence
+  --aof-sync <policy>      always | everysec | never      (default everysec)
   -h, --help               Show this message
 
 Bind to 127.0.0.1 unless you intend to expose the server: it has no
@@ -100,6 +102,14 @@ int main(int argc, char** argv) {
                 std::chrono::seconds(parse_number("--idle-timeout", next()));
         } else if (flag == "--max-value-bytes") {
             config.limits.max_arg_bytes = parse_number("--max-value-bytes", next());
+        } else if (flag == "--aof") {
+            config.aof_path = next();
+        } else if (flag == "--aof-sync") {
+            const std::string policy = next();
+            if (!swiftkv::parse_sync_policy(policy, config.aof_sync)) {
+                std::cerr << "swiftkv-server: --aof-sync must be always, everysec or never\n";
+                return 2;
+            }
         } else {
             std::cerr << "swiftkv-server: unknown option " << flag << "\n";
             usage(2);
@@ -127,8 +137,21 @@ int main(int argc, char** argv) {
               << "\n"
               << "  store shards    : " << server.store().shard_count() << "\n"
               << "  max connections : " << config.max_connections << "\n"
-              << "  idle timeout    : " << config.idle_timeout.count() << "s\n"
-              << "ready. press Ctrl-C to stop." << std::endl;
+              << "  idle timeout    : " << config.idle_timeout.count() << "s\n";
+    if (config.aof_path.empty()) {
+        std::cout << "  persistence     : disabled (in-memory cache only)\n";
+    } else {
+        const auto& replayed = server.replay_result();
+        std::cout << "  persistence     : " << config.aof_path << " (sync="
+                  << swiftkv::to_string(config.aof_sync) << ")\n"
+                  << "  recovered       : " << replayed.commands_applied
+                  << " commands, " << server.store().size() << " keys\n";
+        if (replayed.bytes_discarded > 0) {
+            std::cout << "  note            : discarded " << replayed.bytes_discarded
+                      << " trailing bytes (partial record from an unclean shutdown)\n";
+        }
+    }
+    std::cout << "ready. press Ctrl-C to stop." << std::endl;
 
     while (!g_stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));

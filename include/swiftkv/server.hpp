@@ -12,6 +12,7 @@
 
 #include "swiftkv/commands.hpp"
 #include "swiftkv/net.hpp"
+#include "swiftkv/persistence.hpp"
 #include "swiftkv/protocol.hpp"
 #include "swiftkv/store.hpp"
 
@@ -79,6 +80,12 @@ public:
         Limits limits;
 
         Store::Config store;
+
+        /// Path to the append-only log. Empty disables persistence entirely,
+        /// which is the right setting for a pure cache and for most tests.
+        std::string aof_path;
+
+        AppendOnlyLog::SyncPolicy aof_sync = AppendOnlyLog::SyncPolicy::EverySecond;
     };
 
     explicit Server(Config config);
@@ -108,6 +115,14 @@ public:
 
     /// Prometheus-style metrics.
     [[nodiscard]] std::string metrics_text() const { return executor_.metrics_text(); }
+
+    /// The append-only log, or nullptr when persistence is disabled.
+    [[nodiscard]] AppendOnlyLog* log() noexcept { return log_.get(); }
+
+    /// Outcome of replaying the log at startup.
+    [[nodiscard]] const AppendOnlyLog::ReplayResult& replay_result() const noexcept {
+        return replay_result_;
+    }
 
 private:
     /// One client connection. Touched only by its owning loop thread.
@@ -157,6 +172,8 @@ private:
     Store store_;
     ServerMetrics metrics_;
     CommandExecutor executor_;
+    std::unique_ptr<AppendOnlyLog> log_;
+    AppendOnlyLog::ReplayResult replay_result_;
 
     /// Listening socket. Touched only by the acceptor thread once serving has
     /// begun, and closed only after that thread has been joined.
