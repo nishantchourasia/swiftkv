@@ -37,6 +37,8 @@ Options:
   --max-value-bytes <n>    Largest accepted argument     (default 8388608)
   --aof <path>             Append-only log; enables persistence
   --aof-sync <policy>      always | everysec | never      (default everysec)
+  --admin-port <n>         Enable HTTP dashboard/metrics on this port
+  --admin-host <addr>      Admin bind address             (default 127.0.0.1)
   -h, --help               Show this message
 
 Bind to 127.0.0.1 unless you intend to expose the server: it has no
@@ -102,6 +104,11 @@ int main(int argc, char** argv) {
                 std::chrono::seconds(parse_number("--idle-timeout", next()));
         } else if (flag == "--max-value-bytes") {
             config.limits.max_arg_bytes = parse_number("--max-value-bytes", next());
+        } else if (flag == "--admin-port") {
+            config.admin_port = static_cast<std::uint16_t>(parse_number("--admin-port", next()));
+            config.admin_enabled = true;
+        } else if (flag == "--admin-host") {
+            config.admin_host = next();
         } else if (flag == "--aof") {
             config.aof_path = next();
         } else if (flag == "--aof-sync") {
@@ -149,6 +156,15 @@ int main(int argc, char** argv) {
         if (replayed.bytes_discarded > 0) {
             std::cout << "  note            : discarded " << replayed.bytes_discarded
                       << " trailing bytes (partial record from an unclean shutdown)\n";
+        }
+    }
+    if (config.admin_enabled) {
+        if (server.admin_port() != 0) {
+            std::cout << "  dashboard       : http://" << config.admin_host << ":"
+                      << server.admin_port() << "/\n"
+                      << "  endpoints       : /health /ready /metrics /stats.json\n";
+        } else {
+            std::cout << "  dashboard       : FAILED to bind (server still serving data)\n";
         }
     }
     std::cout << "ready. press Ctrl-C to stop." << std::endl;

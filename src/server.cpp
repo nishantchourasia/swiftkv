@@ -10,6 +10,8 @@
 #include <cstring>
 #include <vector>
 
+#include "dashboard_html.hpp"
+
 namespace swiftkv {
 namespace {
 
@@ -135,6 +137,20 @@ NetResult Server::start() {
     running_.store(true);
     stopping_.store(false);
 
+    if (config_.admin_enabled) {
+        HttpAdminServer::Config admin_config;
+        admin_config.host = config_.admin_host;
+        admin_config.port = config_.admin_port;
+        admin_ = std::make_unique<HttpAdminServer>(admin_config, make_admin_handler());
+
+        const NetResult admin_started = admin_->start();
+        if (!admin_started.ok) {
+            // The admin endpoint is auxiliary; failing to bind it must not take
+            // down a data plane that is otherwise healthy. Report and continue.
+            admin_.reset();
+        }
+    }
+
     for (auto& loop : loops_) {
         loop->thread = std::thread([this, raw = loop.get()] { run_loop(*raw); });
     }
@@ -146,6 +162,10 @@ NetResult Server::start() {
 void Server::stop() {
     if (!running_.exchange(false)) {
         // Still clear structures in case start() failed part-way through.
+        if (admin_) {
+            admin_->stop();
+            admin_.reset();
+        }
         loops_.clear();
         listener_.reset();
         if (log_) {
@@ -157,6 +177,13 @@ void Server::stop() {
     }
 
     stopping_.store(true);
+
+    // Stop the admin endpoint first: it reads metrics and store state, so it
+    // must be gone before any of that is torn down.
+    if (admin_) {
+        admin_->stop();
+        admin_.reset();
+    }
 
     // Wake every thread so none waits out its poll timeout.
     if (acceptor_wakeup_) {
@@ -531,6 +558,47 @@ void Server::sweep_idle(Loop& loop) {
     for (const int fd : expired) {
         close_connection(loop, fd);
     }
+}
+
+HttpAdminServer::Handler Server::make_admin_handler() {
+    return [this](std::string_view method, std::string_view path) -> HttpResponse {
+        (void)method;  // only GET and HEAD reach here
+
+        if (path == "/health") {
+            // Liveness: is the process up at all? An orchestrator restarts on
+            // failure here, so it must not depend on anything that could be
+            // slow or briefly unavailable.
+            return HttpResponse::json("{\"status\":\"ok\"}\n");
+        }
+
+        if (path == "/ready") {
+            // Readiness: should traffic be sent yet? Reported separately from
+            // liveness so a server still replaying its log is waited for rather
+            // than killed.
+            if (ready()) {
+                return HttpResponse::json("{\"status\":\"ready\"}\n");
+            }
+            return HttpResponse::service_unavailable("{\"status\":\"not_ready\"}\n");
+        }
+
+        if (path == "/metrics") {
+            return HttpResponse::text(executor_.metrics_text());
+        }
+
+        if (path == "/stats.json") {
+            return HttpResponse::json(executor_.stats_json());
+        }
+
+        if (path == "/info") {
+            return HttpResponse::text(executor_.info());
+        }
+
+        if (path == "/" || path == "/index.html") {
+            return HttpResponse::html(kDashboardHtml);
+        }
+
+        return HttpResponse::not_found();
+    };
 }
 
 }  // namespace swiftkv

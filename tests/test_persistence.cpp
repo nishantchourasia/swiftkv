@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -462,4 +463,43 @@ TEST_CASE("concurrent appends produce a readable log", "[persistence][concurrenc
     REQUIRE(result.ok);
     REQUIRE(result.commands_applied == kThreads * kPerThread);
     REQUIRE(store.size() == kThreads * kPerThread);
+}
+
+TEST_CASE("concurrent appends alongside the background flusher", "[persistence][concurrency]") {
+    // The scenario the server actually creates: several event-loop threads
+    // appending while the everysec flusher thread wakes to fsync, and then a
+    // close() racing in at the end. The earlier concurrency test used
+    // sync=Never, so no flusher thread existed and this interleaving was never
+    // exercised.
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 400;
+
+    TempLog temp;
+    {
+        AppendOnlyLog::Config config = temp.config(AppendOnlyLog::SyncPolicy::EverySecond);
+        config.flush_interval = std::chrono::milliseconds(5);  // force frequent wakeups
+        // Heap-allocated on purpose. A stack-allocated log puts its mutex at an
+        // address the sanitizer may have seen used by an earlier test's mutex,
+        // and stale shadow state there produces misleading reports.
+        auto log = std::make_unique<AppendOnlyLog>(config);
+        REQUIRE(log->open().ok);
+
+        std::vector<std::jthread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&log, t] {
+                for (int i = 0; i < kPerThread; ++i) {
+                    log->append({"SET", "t" + std::to_string(t) + ":" + std::to_string(i), "v"});
+                }
+            });
+        }
+        threads.clear();  // join before close
+        log->close();
+    }
+
+    Store store;
+    AppendOnlyLog reader(temp.config());
+    const auto result = reader.replay(store);
+
+    REQUIRE(result.ok);
+    REQUIRE(result.commands_applied == kThreads * kPerThread);
 }

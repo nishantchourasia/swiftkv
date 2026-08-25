@@ -1,8 +1,25 @@
 #include "swiftkv/commands.hpp"
 
+#include <chrono>
+#include <iomanip>
 #include <sstream>
 
 namespace swiftkv {
+namespace {
+
+/// Nanoseconds to microseconds. The cast is explicit because -Wconversion is
+/// on: an implicit uint64 -> double narrowing is exactly the kind of silent
+/// precision loss that flag exists to surface.
+double ns_to_us(std::uint64_t nanos) noexcept {
+    return static_cast<double>(nanos) / 1000.0;
+}
+
+/// Nanoseconds to seconds, the unit Prometheus expects for durations.
+double ns_to_seconds(std::uint64_t nanos) noexcept {
+    return static_cast<double>(nanos) / 1e9;
+}
+
+}  // namespace
 
 CommandResult CommandExecutor::wrong_arity(const std::string& verb) {
     metrics_.bump(metrics_.errors);
@@ -11,6 +28,17 @@ CommandResult CommandExecutor::wrong_arity(const std::string& verb) {
 }
 
 CommandResult CommandExecutor::execute(const Command& command) {
+    const auto started = std::chrono::steady_clock::now();
+    CommandResult result = dispatch(command);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    metrics_.command_latency.record(static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+
+    return result;
+}
+
+CommandResult CommandExecutor::dispatch(const Command& command) {
     metrics_.bump(metrics_.commands_total);
 
     if (command.empty()) {
@@ -164,6 +192,16 @@ std::string CommandExecutor::info() const {
     out << "hit_rate:" << stats.hit_rate() << "\r\n";
     out << "errors:" << metrics_.errors.load(std::memory_order_relaxed) << "\r\n";
 
+    const auto latency = metrics_.command_latency.snapshot();
+    out << "# Latency\r\n";
+    out << "latency_samples:" << latency.count << "\r\n";
+    out << "latency_mean_us:" << latency.mean_ns / 1000.0 << "\r\n";
+    out << "latency_p50_us:" << ns_to_us(latency.p50_ns) << "\r\n";
+    out << "latency_p95_us:" << ns_to_us(latency.p95_ns) << "\r\n";
+    out << "latency_p99_us:" << ns_to_us(latency.p99_ns) << "\r\n";
+    out << "latency_p999_us:" << ns_to_us(latency.p999_ns) << "\r\n";
+    out << "latency_max_us:" << ns_to_us(latency.max_ns) << "\r\n";
+
     return out.str();
 }
 
@@ -210,6 +248,94 @@ std::string CommandExecutor::metrics_text() const {
     gauge("swiftkv_bytes", "Bytes currently stored.", static_cast<double>(stats.bytes));
     gauge("swiftkv_hit_rate", "Cache hit rate over the process lifetime.", stats.hit_rate());
 
+    // Server-side service time. Exposed as a summary rather than a Prometheus
+    // histogram because the buckets here are log-linear and would not map onto
+    // Prometheus's fixed le-buckets without losing the resolution that makes
+    // the tail readable.
+    const auto latency = metrics_.command_latency.snapshot();
+    out << "# HELP swiftkv_command_latency_seconds Server-side command service time.\n";
+    out << "# TYPE swiftkv_command_latency_seconds summary\n";
+    out << "swiftkv_command_latency_seconds{quantile=\"0.5\"} "
+        << ns_to_seconds(latency.p50_ns) << '\n';
+    out << "swiftkv_command_latency_seconds{quantile=\"0.9\"} "
+        << ns_to_seconds(latency.p90_ns) << '\n';
+    out << "swiftkv_command_latency_seconds{quantile=\"0.95\"} "
+        << ns_to_seconds(latency.p95_ns) << '\n';
+    out << "swiftkv_command_latency_seconds{quantile=\"0.99\"} "
+        << ns_to_seconds(latency.p99_ns) << '\n';
+    out << "swiftkv_command_latency_seconds{quantile=\"0.999\"} "
+        << ns_to_seconds(latency.p999_ns) << '\n';
+    out << "swiftkv_command_latency_seconds_count " << latency.count << '\n';
+
+    return out.str();
+}
+
+double CommandExecutor::uptime_seconds() const {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
+}
+
+std::string CommandExecutor::stats_json() const {
+    const auto stats = store_.stats();
+    const auto latency = metrics_.command_latency.snapshot();
+    const auto load = [](const std::atomic<std::uint64_t>& a) {
+        return a.load(std::memory_order_relaxed);
+    };
+
+    std::ostringstream out;
+    out.setf(std::ios::fixed);
+    out << "{\n";
+    out << "  \"status\": \"ok\",\n";
+    out << "  \"version\": \"0.1.0\",\n";
+    out << std::setprecision(3);
+    out << "  \"uptime_seconds\": " << uptime_seconds() << ",\n";
+
+    out << "  \"server\": {\n";
+    out << "    \"shards\": " << store_.shard_count() << ",\n";
+    out << "    \"persistence\": " << (log_ != nullptr ? "true" : "false") << "\n";
+    out << "  },\n";
+
+    out << "  \"connections\": {\n";
+    out << "    \"current\": " << load(metrics_.connections_current) << ",\n";
+    out << "    \"accepted\": " << load(metrics_.connections_accepted) << ",\n";
+    out << "    \"rejected\": " << load(metrics_.connections_rejected) << "\n";
+    out << "  },\n";
+
+    out << "  \"commands\": {\n";
+    out << "    \"total\": " << load(metrics_.commands_total) << ",\n";
+    out << "    \"gets\": " << load(metrics_.gets) << ",\n";
+    out << "    \"sets\": " << load(metrics_.sets) << ",\n";
+    out << "    \"deletes\": " << load(metrics_.deletes) << ",\n";
+    out << "    \"errors\": " << load(metrics_.errors) << "\n";
+    out << "  },\n";
+
+    out << "  \"keyspace\": {\n";
+    out << "    \"keys\": " << stats.keys << ",\n";
+    out << "    \"bytes\": " << stats.bytes << ",\n";
+    out << "    \"hits\": " << stats.hits << ",\n";
+    out << "    \"misses\": " << stats.misses << ",\n";
+    out << std::setprecision(4);
+    out << "    \"hit_rate\": " << stats.hit_rate() << ",\n";
+    out << "    \"evictions\": " << stats.evictions << "\n";
+    out << "  },\n";
+
+    out << std::setprecision(3);
+    out << "  \"latency_us\": {\n";
+    out << "    \"count\": " << latency.count << ",\n";
+    out << "    \"mean\": " << latency.mean_ns / 1000.0 << ",\n";
+    out << "    \"p50\": " << ns_to_us(latency.p50_ns) << ",\n";
+    out << "    \"p90\": " << ns_to_us(latency.p90_ns) << ",\n";
+    out << "    \"p95\": " << ns_to_us(latency.p95_ns) << ",\n";
+    out << "    \"p99\": " << ns_to_us(latency.p99_ns) << ",\n";
+    out << "    \"p999\": " << ns_to_us(latency.p999_ns) << ",\n";
+    out << "    \"min\": " << ns_to_us(latency.min_ns) << ",\n";
+    out << "    \"max\": " << ns_to_us(latency.max_ns) << "\n";
+    out << "  },\n";
+
+    out << "  \"traffic\": {\n";
+    out << "    \"bytes_read\": " << load(metrics_.bytes_read) << ",\n";
+    out << "    \"bytes_written\": " << load(metrics_.bytes_written) << "\n";
+    out << "  }\n";
+    out << "}\n";
     return out.str();
 }
 

@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -130,12 +129,37 @@ private:
     Config config_;
     FileDescriptor fd_;
 
+    /// Guards the buffer, the descriptor and the counters. Held only for short
+    /// critical sections, never across a wait.
     mutable std::mutex mutex_;
     std::string pending_;
     Stats stats_;
 
     std::thread flusher_;
-    std::condition_variable flush_cv_;
+
+    /// Wakeup channel for the flusher: an eventfd polled with a timeout, rather
+    /// than a condition variable.
+    ///
+    /// A condition variable is the textbook choice and was tried first. It was
+    /// replaced for two reasons, one about design and one about tooling.
+    ///
+    /// The design reason: a cv requires holding a mutex across the wait. That
+    /// either entangles the data lock with the wait, or needs a second mutex
+    /// purely for the wakeup. An eventfd needs neither -- the flusher blocks in
+    /// poll() holding nothing at all, and takes the data lock only for the
+    /// brief flush itself.
+    ///
+    /// The tooling reason: on this toolchain (gcc 11 + glibc 2.35),
+    /// `condition_variable::wait_for` uses a steady clock and so routes through
+    /// `pthread_cond_clockwait`, which ThreadSanitizer does not intercept. TSan
+    /// therefore never observed the mutex being released during the wait,
+    /// reported a spurious "double lock", and -- because its model of that
+    /// mutex was then inconsistent -- lost the happens-before edges through it,
+    /// cascading into a dozen false data-race reports. Verified by substituting
+    /// a system_clock wait, which TSan does intercept: the reports went to zero
+    /// with no change in the locking. Rather than adopt a wall clock that can
+    /// jump backwards, or suppress a warning, the wait was removed entirely.
+    FileDescriptor wake_fd_;
     std::atomic<bool> stopping_{false};
 };
 

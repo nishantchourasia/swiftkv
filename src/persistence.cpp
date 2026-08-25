@@ -1,6 +1,8 @@
 #include "swiftkv/persistence.hpp"
 
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -66,7 +68,15 @@ NetResult AppendOnlyLog::open() {
     }
 
     if (config_.sync == SyncPolicy::EverySecond) {
-        stopping_.store(false);
+        wake_fd_.reset(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+        if (!wake_fd_) {
+            fd_.reset();
+            return NetResult::failure("eventfd(append-only log)");
+        }
+        // No synchronisation needed for this store: the flusher does not exist
+        // yet, and constructing a std::thread synchronises everything written
+        // before it with the new thread.
+        stopping_.store(false, std::memory_order_relaxed);
         flusher_ = std::thread([this] { run_flusher(); });
     }
 
@@ -75,18 +85,27 @@ NetResult AppendOnlyLog::open() {
 
 void AppendOnlyLog::close() {
     if (flusher_.joinable()) {
-        stopping_.store(true);
-        flush_cv_.notify_all();
+        // Set the flag before signalling. The flusher re-checks it after poll()
+        // returns, so there is no lost-wakeup window: either it sees the flag on
+        // its next check, or poll() reports the eventfd and it checks again.
+        stopping_.store(true, std::memory_order_release);
+        const std::uint64_t one = 1;
+        ssize_t ignored = ::write(wake_fd_.get(), &one, sizeof(one));
+        (void)ignored;
         flusher_.join();
     }
+    wake_fd_.reset();
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_) {
-            flush_locked();
-            ::fsync(fd_.get());
-        }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (fd_) {
+        flush_locked();
+        ::fsync(fd_.get());
     }
+    // Reset inside the lock. Previously this sat outside it, so closing the
+    // descriptor raced with append() and sync() reading fd_ under the lock --
+    // and worse than a race, an append could pass its `if (!fd_)` check, have
+    // the descriptor closed underneath it, and then write to a number the
+    // kernel had already handed to some other file. ThreadSanitizer caught it.
     fd_.reset();
 }
 
@@ -148,19 +167,31 @@ void AppendOnlyLog::sync() {
 }
 
 void AppendOnlyLog::run_flusher() {
-    while (!stopping_.load()) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        // Waiting on a condition variable rather than sleeping means close()
-        // returns immediately instead of after up to a full interval.
-        flush_cv_.wait_for(lock, config_.flush_interval,
-                           [this] { return stopping_.load(); });
+    const int timeout_ms = static_cast<int>(config_.flush_interval.count());
 
-        if (!fd_) {
+    while (!stopping_.load(std::memory_order_acquire)) {
+        // Block holding no lock at all. poll() returns either when the interval
+        // elapses or as soon as close() writes to the eventfd, so shutdown is
+        // immediate rather than waiting out a full interval.
+        pollfd waiter{};
+        waiter.fd = wake_fd_.get();
+        waiter.events = POLLIN;
+
+        const int ready = ::poll(&waiter, 1, timeout_ms);
+        if (ready < 0 && errno == EINTR) {
             continue;
         }
-        flush_locked();
-        ::fsync(fd_.get());
-        ++stats_.fsyncs;
+        if (waiter.revents & POLLIN) {
+            std::uint64_t drained = 0;
+            ssize_t ignored = ::read(wake_fd_.get(), &drained, sizeof(drained));
+            (void)ignored;
+        }
+        if (stopping_.load(std::memory_order_acquire)) {
+            break;  // close() performs the final flush and fsync
+        }
+
+        // Take the data lock only for the flush itself.
+        sync();
     }
 }
 

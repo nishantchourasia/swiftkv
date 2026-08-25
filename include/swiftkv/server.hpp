@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "swiftkv/admin.hpp"
 #include "swiftkv/commands.hpp"
 #include "swiftkv/net.hpp"
 #include "swiftkv/persistence.hpp"
@@ -86,6 +87,13 @@ public:
         std::string aof_path;
 
         AppendOnlyLog::SyncPolicy aof_sync = AppendOnlyLog::SyncPolicy::EverySecond;
+
+        /// Serve /health, /ready, /metrics, /stats.json and the dashboard over
+        /// HTTP on a second port. Off by default: a process should not open a
+        /// port nobody asked for.
+        bool admin_enabled = false;
+        std::string admin_host = "127.0.0.1";
+        std::uint16_t admin_port = 6381;
     };
 
     explicit Server(Config config);
@@ -123,6 +131,23 @@ public:
     [[nodiscard]] const AppendOnlyLog::ReplayResult& replay_result() const noexcept {
         return replay_result_;
     }
+
+    /// JSON snapshot, as served at /stats.json.
+    [[nodiscard]] std::string stats_json() const { return executor_.stats_json(); }
+
+    /// The admin HTTP port actually bound, or 0 when the endpoint is disabled.
+    [[nodiscard]] std::uint16_t admin_port() const noexcept {
+        return admin_ ? admin_->port() : 0;
+    }
+
+    /// Whether the server is ready to accept traffic. Reported by /ready.
+    ///
+    /// Distinct from /health on purpose: a process can be alive but not yet
+    /// able to serve -- during log replay, for instance. An orchestrator uses
+    /// liveness to decide whether to restart and readiness to decide whether to
+    /// send traffic, and conflating them causes a slow-starting server to be
+    /// killed instead of waited for.
+    [[nodiscard]] bool ready() const noexcept { return running_.load() && !stopping_.load(); }
 
 private:
     /// One client connection. Touched only by its owning loop thread.
@@ -168,12 +193,16 @@ private:
     void sweep_idle(Loop& loop);
     void wake(Loop& loop);
 
+    /// Build the routing function the admin HTTP server calls.
+    HttpAdminServer::Handler make_admin_handler();
+
     Config config_;
     Store store_;
     ServerMetrics metrics_;
     CommandExecutor executor_;
     std::unique_ptr<AppendOnlyLog> log_;
     AppendOnlyLog::ReplayResult replay_result_;
+    std::unique_ptr<HttpAdminServer> admin_;
 
     /// Listening socket. Touched only by the acceptor thread once serving has
     /// begun, and closed only after that thread has been joined.

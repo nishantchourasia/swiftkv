@@ -44,12 +44,14 @@ find_package(Threads REQUIRED)
 
 add_library(swiftkv_core
     src/lru.cpp
+    src/latency.cpp
     src/store.cpp
     src/protocol.cpp
     src/commands.cpp
     src/net.cpp
     src/server.cpp
     src/client.cpp
+    src/admin.cpp
     src/persistence.cpp
 )
 target_include_directories(swiftkv_core PUBLIC include)
