@@ -1,0 +1,12 @@
+# SwiftKV load-test environment
+date            : 2026-08-25T16:21:28+05:30
+host            : Linux 6.8.0-107-generic x86_64
+cpu             : AMD EPYC 9754 128-Core Processor
+cores           : 512 logical
+memory          : 503 GB
+compiler        : g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+build           : Release (-O3)
+server          : io-threads=8 shards=64
+loopback        : client and server on the same host (127.0.0.1)
+concurrent load : 18 gem5 simulation jobs running on this machine
+load average    : 27.37, 27.01, 26.28

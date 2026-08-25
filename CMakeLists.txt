@@ -60,3 +60,13 @@ target_link_libraries(swiftkv_core PUBLIC Threads::Threads)
 
 enable_testing()
 add_subdirectory(tests)
+
+# ---------------------------------------------------------------------------
+# Executables
+# ---------------------------------------------------------------------------
+
+add_executable(swiftkv-server apps/server_main.cpp)
+target_link_libraries(swiftkv-server PRIVATE swiftkv_core)
+
+add_executable(swiftkv-bench apps/bench_main.cpp)
+target_link_libraries(swiftkv-bench PRIVATE swiftkv_core)
