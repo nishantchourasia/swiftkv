@@ -56,13 +56,16 @@ write one of these yourself:
 | Append-only log persistence, three sync policies | ✅ Working |
 | Crash recovery, log compaction | ✅ Working |
 | Connection limits, idle timeouts, request size caps | ✅ Working |
+| Graceful shutdown: drains in-flight requests before closing | ✅ Working |
 | `INFO` + Prometheus-format metrics | ✅ Working |
+| Server-side latency percentiles (p50/p90/p95/p99/p99.9) | ✅ Working |
+| HTTP endpoints: `/health` `/ready` `/metrics` `/stats.json` | ✅ Working |
+| Web dashboard (live, no hardcoded data) | ✅ Working |
 | Purpose-built benchmark client | ✅ Working |
 | **Multi-node cluster + replication** | ❌ **Not built yet** |
-| **Web dashboard** | ❌ **Not built yet** |
 | **Docker image** | ⚠️ Not verifiable here — no Docker daemon access on this machine |
 
-The last three are listed as missing rather than quietly omitted. See
+The last two are listed as missing rather than quietly omitted. See
 [Limitations](#12-limitations).
 
 ## 4. Architecture
@@ -146,7 +149,8 @@ redis-cli -p 6380 GET greeting
 ctest --test-dir build --output-on-failure
 ```
 
-**Measured:** 146 test cases across 6 binaries, all passing, in 1.72 seconds.
+**Measured:** 212 test cases across 9 binaries, 57,981 assertions, all passing,
+in 2.77 seconds.
 
 | Suite | Cases | Covers |
 |-------|-------|--------|
@@ -155,7 +159,10 @@ ctest --test-dir build --output-on-failure
 | `test_protocol` | 29 | Parsing, partial reads, malformed input, size limits |
 | `test_commands` | 25 | Command surface, errors, metrics |
 | `test_server` | 30 | Real sockets, pipelining, limits, durability |
-| `test_persistence` | 19 | Round trips, crash recovery, compaction |
+| `test_persistence` | 20 | Round trips, crash recovery, compaction |
+| `test_latency` | 16 | Histogram bucketing, percentiles, concurrent recording |
+| `test_admin` | 29 | HTTP endpoints, dashboard, request parsing |
+| `test_shutdown` | 20 | Graceful drain, mass disconnection, descriptor leaks |
 
 Under sanitizers:
 
@@ -164,9 +171,14 @@ cmake -S . -B build-tsan -DSWIFTKV_TSAN=ON && cmake --build build-tsan -j
 setarch $(uname -m) -R ./build-tsan/tests/test_server
 ```
 
-**Measured:** clean under ThreadSanitizer and under AddressSanitizer+UBSan.
-TSan found one real race during development — `stop()` closed the listening
-socket while the acceptor thread was still using it — which is fixed.
+**Measured:** all 9 suites clean under ThreadSanitizer (0 races) and under
+AddressSanitizer+UBSan (0 errors).
+
+TSan earned its keep twice. It found `stop()` closing the listening socket while
+the acceptor thread was still using it, and later found the append-only log
+resetting its descriptor outside the lock — where an append could pass its null
+check and then write to a descriptor number the kernel had already reassigned.
+Both are fixed.
 
 > `setarch -R` disables address-space randomisation. ThreadSanitizer needs a
 > fixed memory layout and aborts without it on recent kernels.

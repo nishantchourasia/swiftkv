@@ -16,7 +16,8 @@ namespace swiftkv {
 namespace {
 
 constexpr std::size_t kReadChunk = 64 * 1024;
-constexpr int kPollTimeoutMs = 500;  // bounds how long a sweep or stop waits
+constexpr int kPollTimeoutMs = 500;      // bounds how long a sweep or stop waits
+constexpr int kDrainPollTimeoutMs = 5;   // shutdown should not wait out a full poll
 
 }  // namespace
 
@@ -159,15 +160,20 @@ NetResult Server::start() {
     return NetResult::success();
 }
 
-void Server::stop() {
+void Server::stop() { stop(config_.shutdown_grace); }
+
+void Server::stop(std::chrono::milliseconds grace) {
     if (!running_.exchange(false)) {
-        // Still clear structures in case start() failed part-way through.
+        // start() failed part-way through, or stop() was already called. Clear
+        // whatever exists so nothing is left holding a descriptor.
         if (admin_) {
             admin_->stop();
             admin_.reset();
         }
         loops_.clear();
         listener_.reset();
+        acceptor_epoll_.reset();
+        acceptor_wakeup_.reset();
         if (log_) {
             executor_.set_log(nullptr);
             log_->close();
@@ -176,30 +182,20 @@ void Server::stop() {
         return;
     }
 
-    stopping_.store(true);
+    // ---- Phase 1: stop accepting -------------------------------------------
+    //
+    // The acceptor is joined BEFORE the listener closes. It is the only thread
+    // that touches the listening socket, so closing it from here while that
+    // thread still runs is a data race -- and worse, the descriptor number
+    // could be reused by a freshly accepted client, leaving the acceptor
+    // calling accept on a client socket. ThreadSanitizer caught this once.
+    draining_.store(true);
 
-    // Stop the admin endpoint first: it reads metrics and store state, so it
-    // must be gone before any of that is torn down.
-    if (admin_) {
-        admin_->stop();
-        admin_.reset();
-    }
-
-    // Wake every thread so none waits out its poll timeout.
     if (acceptor_wakeup_) {
         const std::uint64_t one = 1;
         ssize_t ignored = ::write(acceptor_wakeup_.get(), &one, sizeof(one));
         (void)ignored;
     }
-    for (auto& loop : loops_) {
-        wake(*loop);
-    }
-
-    // Join the acceptor BEFORE closing the listener. The acceptor is the only
-    // thread that touches listener_, so closing it from here while that thread
-    // still runs is a data race -- and worse, the descriptor number could be
-    // reused by a freshly accepted client, leaving the acceptor calling accept
-    // on a client socket. ThreadSanitizer caught this.
     if (acceptor_.joinable()) {
         acceptor_.join();
     }
@@ -207,22 +203,70 @@ void Server::stop() {
     acceptor_epoll_.reset();
     acceptor_wakeup_.reset();
 
+    // ---- Phase 2: drain in-flight work -------------------------------------
+    //
+    // The loops keep running. Each answers every command it has already
+    // received and writes the reply out; a connection closes only once its
+    // reply has been fully sent. Note that running_ is already false, so /ready
+    // reports 503 throughout -- a load balancer stops sending new work while
+    // the existing work finishes.
+    for (auto& loop : loops_) {
+        wake(*loop);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    bool all_drained = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        all_drained = true;
+        for (const auto& loop : loops_) {
+            if (!loop->drained.load(std::memory_order_acquire)) {
+                all_drained = false;
+                break;
+            }
+        }
+        if (all_drained) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    drain_completed_ = all_drained;
+    forced_closed_ = all_drained
+                         ? 0
+                         : static_cast<std::size_t>(
+                               metrics_.connections_current.load(std::memory_order_relaxed));
+
+    // ---- Phase 3: hard stop ------------------------------------------------
+    stopping_.store(true);
+    for (auto& loop : loops_) {
+        wake(*loop);
+    }
     for (auto& loop : loops_) {
         if (loop->thread.joinable()) {
             loop->thread.join();
         }
     }
-
     loops_.clear();
 
-    // Close the log only after every loop has stopped, so no thread can append
-    // to a log that is being torn down. close() flushes and fsyncs, so a clean
-    // shutdown loses nothing regardless of sync policy.
+    // ---- Phase 4: shut down auxiliaries ------------------------------------
+    //
+    // The admin endpoint stays up through the drain so health checks keep
+    // answering while work finishes, and is stopped only once the loops have.
+    if (admin_) {
+        admin_->stop();
+        admin_.reset();
+    }
+
+    // The log closes last, after every loop has stopped, so nothing can append
+    // to a log being torn down. close() flushes and fsyncs, so a graceful stop
+    // loses nothing regardless of sync policy.
     if (log_) {
         executor_.set_log(nullptr);
         log_->close();
         log_.reset();
     }
+
+    draining_.store(false);
 }
 
 void Server::wake(Loop& loop) {
@@ -236,7 +280,10 @@ void Server::wake(Loop& loop) {
 // ---------------------------------------------------------------------------
 
 void Server::run_acceptor() {
-    while (!stopping_.load()) {
+    // Exits on `draining_`, not just `stopping_`. Phase 1 of shutdown sets only
+    // draining_ and then joins this thread, so waiting for stopping_ here would
+    // deadlock: the join would never return and shutdown would hang forever.
+    while (!draining_.load() && !stopping_.load()) {
         const int fd = ::accept4(listener_.get(), nullptr, nullptr,
                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
@@ -314,9 +361,12 @@ void Server::run_loop(Loop& loop) {
     std::vector<epoll_event> events(256);
 
     while (!stopping_.load()) {
+        // Poll far more often while draining: shutdown should take milliseconds,
+        // not a full poll interval per pass.
+        const int timeout = draining_.load() ? kDrainPollTimeoutMs : kPollTimeoutMs;
         const int count =
             ::epoll_wait(loop.epoll.get(), events.data(), static_cast<int>(events.size()),
-                         kPollTimeoutMs);
+                         timeout);
         if (count < 0) {
             if (errno == EINTR) {
                 continue;
@@ -357,11 +407,25 @@ void Server::run_loop(Loop& loop) {
             }
         }
 
-        adopt_pending(loop);
-        sweep_idle(loop);
+        if (draining_.load()) {
+            // Connections still in the handoff queue were already accepted --
+            // the client believes it is connected. They are adopted and drained
+            // like any other, not discarded: throwing away work the server has
+            // already accepted is exactly what a graceful stop must not do.
+            // The acceptor has stopped, so this queue only ever shrinks.
+            adopt_pending(loop);
+            drain_step(loop);
+        } else {
+            adopt_pending(loop);
+            sweep_idle(loop);
+        }
     }
 
-    // Shutting down: drop every connection this loop owns.
+    // Hard stop. Anything handed over but never adopted still holds a
+    // descriptor, so close those too rather than leaking them.
+    discard_pending(loop);
+
+    // Drop every connection this loop owns.
     for (auto& [fd, connection] : loop.connections) {
         (void)fd;
         (void)connection;
@@ -392,15 +456,77 @@ void Server::adopt_pending(Loop& loop) {
     }
 }
 
+void Server::discard_pending(Loop& loop) {
+    std::vector<int> pending;
+    {
+        std::lock_guard<std::mutex> lock(loop.handoff_mutex);
+        pending.swap(loop.handoff);
+    }
+    for (const int fd : pending) {
+        FileDescriptor closing(fd);  // destructor closes it
+        metrics_.connections_current.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+void Server::drain_step(Loop& loop) {
+    // Snapshot the descriptors first: flush() can close a connection, which
+    // erases it from the map and would invalidate an iterator held across it.
+    std::vector<int> fds;
+    fds.reserve(loop.connections.size());
+    for (const auto& entry : loop.connections) {
+        fds.push_back(entry.first);
+    }
+
+    for (const int fd : fds) {
+        auto it = loop.connections.find(fd);
+        if (it == loop.connections.end()) {
+            continue;
+        }
+        Connection& connection = *it->second;
+
+        if (!connection.close_after_write) {
+            // Pull whatever the client has already sent and answer it. This
+            // must happen before deciding the connection is finished: a client
+            // that sent a batch microseconds before the stop arrived may not
+            // have had its bytes read yet, and closing on an empty inbox would
+            // discard work that was genuinely in flight.
+            handle_readable(loop, connection);
+
+            // handle_readable may have closed it (peer hung up, or a fatal
+            // protocol error).
+            if (loop.connections.find(fd) == loop.connections.end()) {
+                continue;
+            }
+
+            // Only once a pass reads nothing new is the client considered done
+            // talking. Until then the drain keeps answering, bounded by the
+            // grace deadline in stop().
+            if (connection.last_read_bytes == 0) {
+                connection.close_after_write = true;
+            }
+        }
+
+        // flush() closes the connection once the outbox has drained. A
+        // connection with a partially written reply stays open until EPOLLOUT
+        // lets the rest through, or until the grace period expires.
+        flush(loop, connection);
+    }
+
+    loop.drained.store(loop.connections.empty(), std::memory_order_release);
+}
+
 void Server::handle_readable(Loop& loop, Connection& connection) {
     const int fd = connection.fd.get();
     char buffer[kReadChunk];
+
+    connection.last_read_bytes = 0;
 
     while (true) {
         const ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
 
         if (n > 0) {
             connection.inbox.append(buffer, static_cast<std::size_t>(n));
+            connection.last_read_bytes += static_cast<std::size_t>(n);
             metrics_.bump(metrics_.bytes_read, static_cast<std::uint64_t>(n));
 
             // Bound the buffer. Without this a client could stream bytes that

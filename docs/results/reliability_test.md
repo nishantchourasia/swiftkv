@@ -9,7 +9,7 @@ path flushes and fsyncs the log on the way out.
 All results below are **Measured** -- produced by running
 `scripts/run_reliability_test.sh` on this machine.
 
-Date: 2026-08-25T19:09:19+05:30
+Date: 2026-08-26T13:07:49+05:30
 Host: Linux 6.8.0-107-generic x86_64, 512 cores
 
 | Scenario | Expected | Actual | Result |

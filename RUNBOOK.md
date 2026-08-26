@@ -87,7 +87,7 @@ Produces:
 |------|-----------|
 | `build/swiftkv-server` | The server |
 | `build/swiftkv-bench` | Load generator |
-| `build/tests/test_*` | Six test binaries |
+| `build/tests/test_*` | Nine test binaries |
 
 **Common errors**
 
@@ -106,14 +106,14 @@ ctest --test-dir build --output-on-failure
 ```
 
 **When:** after every change, before every commit.
-**What it does:** runs all six test binaries. `--output-on-failure` prints
+**What it does:** runs all nine test binaries. `--output-on-failure` prints
 details only for failures.
 
 **Expected result:**
 
 ```
-100% tests passed, 0 tests failed out of 6
-Total Test time (real) =   1.72 sec
+100% tests passed, 0 tests failed out of 9
+Total Test time (real) =   2.77 sec
 ```
 
 To run one suite, or one group of tests within it:
@@ -151,6 +151,7 @@ swiftkv-server listening on 127.0.0.1:6380
   max connections : 10000
   idle timeout    : 300s
   persistence     : disabled (in-memory cache only)
+  shutdown grace  : 5000ms
 ready. press Ctrl-C to stop.
 ```
 
@@ -164,6 +165,8 @@ Useful options (`--help` lists all):
 | `--max-connections 10000` | Refuse beyond this many clients. |
 | `--aof data/appendonly.aof` | Turn on persistence. |
 | `--aof-sync everysec` | `always`, `everysec` or `never`. |
+| `--admin-port 6381` | Enable the HTTP dashboard and metrics endpoints. |
+| `--shutdown-grace 5000` | Milliseconds to drain in-flight work on shutdown. |
 
 ⚠️ **SwiftKV has no authentication.** Anything that can reach the port can read
 and write every key. Keep the default `127.0.0.1` bind unless you have put
@@ -355,6 +358,60 @@ compact either. This is a known gap.
 verified on this machine** — the account is not in the `docker` group and there
 is no sudo to add it. When it is added it will be marked unverified, because
 claiming a build works when it has never been run would be dishonest.
+
+---
+
+## STEP 12a — Stopping the server gracefully
+
+```bash
+kill -TERM <pid>      # or press Ctrl-C in the server's terminal
+```
+
+**When:** to stop the server without dropping work clients have already sent.
+**What it does:** runs a four-phase shutdown — stop accepting, drain in-flight
+requests, close connections once their replies are written, then flush and close
+the log.
+
+**Expected result:**
+
+```
+shutting down: no longer accepting connections, draining in-flight requests
+(Ctrl-C again to quit immediately)...
+drained cleanly in 23ms
+served 164000 commands across 40 connections
+```
+
+**Measured:** that output is from a real run — a live server under load from 40
+connections, sent `SIGTERM`. Restarting it recovered 55,859 keys, exactly the
+live count before the signal, with `--aof-sync never`. Since nothing is fsynced
+during normal operation at that setting, the data could only have survived
+because shutdown flushed it.
+
+**If you see this instead:**
+
+```
+grace period expired after 5000ms; force-closed 3 connection(s) with work outstanding
+```
+
+Then the drain did not finish. It means either the grace period is too short for
+your workload (raise `--shutdown-grace`), or a client requested data and stopped
+reading it. The server does not wait indefinitely on purpose: an orchestrator
+that sent `SIGTERM` will send `SIGKILL` shortly after, and an unflushed log is
+worse than a forced close.
+
+**In a hurry?** Press Ctrl-C (or send the signal) a second time. The process
+exits immediately without draining.
+
+> **Why not just kill it?** `SIGKILL` cannot be caught, so the server has no
+> chance to answer in-flight requests or flush the log. Use it only when the
+> process is stuck — and note that recovery from it *is* tested; see STEP 9.
+
+**Common errors**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Shutdown takes the full grace period every time | A client is not reading its replies | Find it, or lower `--shutdown-grace` |
+| Clients report broken connections at shutdown | Expected for clients idle mid-connection; in-flight requests are still answered | None needed |
 
 ---
 

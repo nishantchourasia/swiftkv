@@ -88,6 +88,15 @@ public:
 
         AppendOnlyLog::SyncPolicy aof_sync = AppendOnlyLog::SyncPolicy::EverySecond;
 
+        /// How long a graceful stop waits for in-flight work to finish before
+        /// closing whatever is left.
+        ///
+        /// Bounded on purpose. An unbounded drain lets one stuck client hold
+        /// the whole shutdown open, and an orchestrator that asked politely
+        /// with SIGTERM will send SIGKILL soon after regardless -- at which
+        /// point an unflushed log is worse than a forced close.
+        std::chrono::milliseconds shutdown_grace{5000};
+
         /// Serve /health, /ready, /metrics, /stats.json and the dashboard over
         /// HTTP on a second port. Off by default: a process should not open a
         /// port nobody asked for.
@@ -107,7 +116,40 @@ public:
     NetResult start();
 
     /// Stop serving and join all threads. Idempotent.
+    ///
+    /// Shutdown runs in phases rather than all at once:
+    ///
+    ///   1. **Stop accepting.** The acceptor is joined and the listening socket
+    ///      closed, so no new connection can arrive.
+    ///   2. **Drain.** The event loops keep running. Each connection is given a
+    ///      final read, every command already received is executed, and the
+    ///      reply is written out. A connection closes once its reply has been
+    ///      fully sent -- not before.
+    ///   3. **Hard stop** once every loop reports drained, or the grace period
+    ///      expires. Anything still open is closed.
+    ///   4. **Flush and close the log**, after every loop has stopped, so
+    ///      nothing can append to a log being torn down.
+    ///
+    /// Without phase 2 a client that had sent a command and was waiting for its
+    /// answer would simply have the socket closed underneath it. That is the
+    /// difference between stopping and stopping gracefully.
     void stop();
+
+    /// Stop with an explicit grace period, overriding the configured one.
+    void stop(std::chrono::milliseconds grace);
+
+    /// True while a graceful stop is draining in-flight work.
+    [[nodiscard]] bool draining() const noexcept { return draining_.load(); }
+
+    /// Whether the last stop drained every connection within its grace period.
+    ///
+    /// False means the deadline expired with work outstanding and connections
+    /// were force-closed. Worth logging: it is the signal that the grace period
+    /// is too short, or that a client is not reading its replies.
+    [[nodiscard]] bool drain_completed() const noexcept { return drain_completed_; }
+
+    /// Connections still open when the grace period expired. 0 on a clean drain.
+    [[nodiscard]] std::size_t forced_closed() const noexcept { return forced_closed_; }
 
     [[nodiscard]] bool running() const noexcept { return running_.load(); }
 
@@ -157,6 +199,11 @@ private:
         std::string outbox;  ///< bytes to write, not yet sent
         std::size_t written = 0;
         bool close_after_write = false;
+
+        /// Bytes pulled from the socket by the most recent read. The drain uses
+        /// it to tell "this client has sent everything" from "nothing has
+        /// arrived yet", which decides whether the connection may be closed.
+        std::size_t last_read_bytes = 0;
         std::chrono::steady_clock::time_point last_active;
 
         explicit Connection(FileDescriptor descriptor)
@@ -169,6 +216,12 @@ private:
         FileDescriptor epoll;
         FileDescriptor wakeup;  ///< eventfd used to interrupt epoll_wait
         std::thread thread;
+
+        /// Set by the loop thread once it has finished draining and owns no
+        /// connections. Read by the stopping thread to know when phase 2 is
+        /// done, so shutdown returns as soon as the work is finished rather
+        /// than always waiting out the full grace period.
+        std::atomic<bool> drained{false};
 
         /// Connections owned by this loop, keyed by descriptor. Only the loop
         /// thread reads or writes this.
@@ -191,6 +244,13 @@ private:
     void update_interest(Loop& loop, Connection& connection);
     void close_connection(Loop& loop, int fd);
     void sweep_idle(Loop& loop);
+
+    /// One pass of graceful drain over a loop's connections.
+    void drain_step(Loop& loop);
+
+    /// Close descriptors handed over but never adopted, so a shutdown racing
+    /// the acceptor does not leak them.
+    void discard_pending(Loop& loop);
     void wake(Loop& loop);
 
     /// Build the routing function the admin HTTP server calls.
@@ -219,7 +279,15 @@ private:
     std::thread acceptor_;
 
     std::atomic<bool> running_{false};
+
+    /// Phase 2: loops keep serving but finish and close their connections.
+    std::atomic<bool> draining_{false};
+
+    /// Phase 3: loops exit immediately.
     std::atomic<bool> stopping_{false};
+
+    bool drain_completed_ = true;
+    std::size_t forced_closed_ = 0;
     std::atomic<std::size_t> next_loop_{0};
 };
 

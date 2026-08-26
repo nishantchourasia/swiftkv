@@ -14,8 +14,11 @@ running the command shown.
 
 | Category | Status | Evidence |
 |----------|--------|----------|
-| Unit tests | ✅ **PASSED** — 97 cases | `ctest --test-dir build` |
-| Integration tests | ✅ **PASSED** — 30 cases, real sockets | `./build/tests/test_server` |
+| Unit tests | ✅ **PASSED** — 113 cases | `ctest --test-dir build` |
+| Integration tests | ✅ **PASSED** — 59 cases, real sockets | `test_server`, `test_admin` |
+| Graceful-shutdown tests | ✅ **PASSED** — 20 cases | `./build/tests/test_shutdown` |
+| Mass-disconnect tests | ✅ **PASSED** — 5 scenarios | `test_shutdown "[disconnect]"` |
+| Descriptor-leak tests | ✅ **PASSED** — 4 scenarios | `test_shutdown "[fd]"` |
 | Crash/recovery tests | ✅ **PASSED** — 19 cases + 9 `SIGKILL` scenarios | `./scripts/run_reliability_test.sh` |
 | Concurrency tests | ✅ **PASSED** — clean under ThreadSanitizer | `build-tsan` |
 | Memory safety | ✅ **PASSED** — clean under ASan + UBSan | `build-asan` |
@@ -27,7 +30,7 @@ running the command shown.
 | Multi-node / replication tests | ❌ **NOT APPLICABLE** — feature does not exist |
 | Docker tests | ❌ **BLOCKED** — no Docker daemon access |
 
-**Totals: 146 test cases across 6 binaries, 54,427 assertions, 1.72 seconds.**
+**Totals: 212 test cases across 9 binaries, 57,981 assertions, 2.77 seconds.**
 
 ---
 
@@ -204,6 +207,89 @@ The harness is **closed-loop**: a worker waiting on a reply is not issuing new
 requests, so offered load falls when the server slows. Percentiles are therefore
 optimistic under saturation (coordinated omission). Concurrency is swept across
 runs so the degradation curve remains visible. An open-loop mode is future work.
+
+---
+
+## 5a. Graceful shutdown, mass disconnection, descriptor leaks
+
+### `test_shutdown` — 20 cases, 1,514 assertions ✅ PASSED
+
+**Graceful shutdown (8 cases).** The defining test pipelines 300 commands
+without reading, then stops the server, then reads: **all 300 replies arrive**.
+Before the drain phase existed, zero arrived — the socket was simply closed on a
+client waiting for work it had already sent.
+
+| Scenario | Result |
+|----------|--------|
+| 300 pipelined in-flight commands all answered | ✅ PASS |
+| A 4 MB reply is fully written before closing | ✅ PASS |
+| New connections refused immediately once stopping | ✅ PASS |
+| `/ready` reports false throughout the drain | ✅ PASS |
+| `stop()` idempotent; safe on a never-started server | ✅ PASS |
+| Five start/stop cycles | ✅ PASS |
+| A client that stops reading cannot hold shutdown open | ✅ PASS (bounded < 3 s) |
+
+**Persistence across graceful shutdown (3 cases).** The flush test runs with
+`sync=never`, so nothing is fsynced during normal operation — surviving data can
+only mean shutdown flushed it.
+
+| Scenario | Result |
+|----------|--------|
+| 200 keys survive with `sync=never` | ✅ PASS |
+| In-flight writes are both answered and durable | ✅ PASS |
+| Four graceful restarts accumulate 40 keys correctly | ✅ PASS |
+
+**Mass disconnection (5 cases).** Clients are dropped with `SO_LINGER 0`, which
+sends RST rather than FIN — what a killed process or a yanked cable looks like,
+exercising the write-side `EPIPE`/`ECONNRESET` path rather than a tidy EOF.
+
+| Scenario | Result |
+|----------|--------|
+| 200 clients reset mid-reply (256 KB payload) | ✅ PASS |
+| 16 threads × 25 connections, half reset / half closed | ✅ PASS |
+| 150 connections dropped mid-command (truncated RESP) | ✅ PASS |
+| Mass disconnection concurrent with shutdown | ✅ PASS |
+| Connection gauge returns to zero afterwards | ✅ PASS |
+
+**Descriptor leaks (4 cases).** Counted directly from `/proc/self/fd`, the only
+way to observe a leak. A leaked descriptor is worse than a memory leak: the
+process hits `RLIMIT_NOFILE` and can then accept no connection at all.
+
+| Scenario | Result |
+|----------|--------|
+| 10 start/stop cycles | ✅ PASS — count did not grow |
+| 200 connect/disconnect cycles | ✅ PASS |
+| 300 abruptly reset connections | ✅ PASS |
+| Shutdown racing the acceptor (5 rounds) | ✅ PASS |
+
+The last one exists because connections can sit in a loop's handoff queue at the
+instant the acceptor stops. Those descriptors were never registered with epoll,
+so shutdown has to close them explicitly.
+
+### Verified end to end with a real signal
+
+A live server under load from 40 connections was sent `SIGTERM`:
+
+```
+shutting down: no longer accepting connections, draining in-flight requests...
+drained cleanly in 23ms
+served 164000 commands across 40 connections
+```
+
+Restarting it recovered **55,859 keys — exactly the live count before the
+signal** — with `--aof-sync never`, which proves the flush happened at shutdown
+rather than during operation.
+
+### Two real bugs found by these tests
+
+1. **The acceptor exited on the wrong flag.** Phase 1 joins the acceptor while
+   only `draining_` is set, but the acceptor waited for `stopping_` — which is
+   not set until phase 3, which was waiting for the join. A deadlock, found the
+   first time shutdown was exercised.
+2. **Accepted connections were discarded, then closed too early.** The first
+   drain threw away connections still in the handoff queue, and then closed
+   connections after processing an empty inbox — before their data had been
+   read. Both meant zero of 300 in-flight replies were delivered.
 
 ---
 

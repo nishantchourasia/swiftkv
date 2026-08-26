@@ -1,5 +1,8 @@
 /// swiftkv-server -- the key-value server daemon.
 
+#include <chrono>
+#include <unistd.h>
+
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -12,13 +15,25 @@
 namespace {
 
 std::atomic<bool> g_stop{false};
+std::atomic<int> g_signal_count{0};
 
-/// Signal handler. Async-signal-safe: it only stores to an atomic flag.
+/// Signal handler. Async-signal-safe: it only touches atomics and, on a second
+/// signal, calls _exit.
 ///
 /// Doing real work here -- logging, locking, closing sockets -- would be
 /// undefined behaviour, because a signal can arrive in the middle of any
 /// operation, including one already holding the lock the handler wants.
-void on_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
+///
+/// A second signal means the operator is no longer willing to wait for the
+/// graceful drain, so the process leaves immediately. _exit is used rather than
+/// exit because it runs no destructors and flushes no streams, which is the
+/// only safe thing to do from a handler.
+void on_signal(int) {
+    if (g_signal_count.fetch_add(1, std::memory_order_relaxed) >= 1) {
+        ::_exit(130);
+    }
+    g_stop.store(true, std::memory_order_relaxed);
+}
 
 [[noreturn]] void usage(int code) {
     std::cout << R"(swiftkv-server -- distributed key-value store
@@ -39,6 +54,7 @@ Options:
   --aof-sync <policy>      always | everysec | never      (default everysec)
   --admin-port <n>         Enable HTTP dashboard/metrics on this port
   --admin-host <addr>      Admin bind address             (default 127.0.0.1)
+  --shutdown-grace <ms>    Drain time on SIGTERM/SIGINT   (default 5000)
   -h, --help               Show this message
 
 Bind to 127.0.0.1 unless you intend to expose the server: it has no
@@ -109,6 +125,9 @@ int main(int argc, char** argv) {
             config.admin_enabled = true;
         } else if (flag == "--admin-host") {
             config.admin_host = next();
+        } else if (flag == "--shutdown-grace") {
+            config.shutdown_grace =
+                std::chrono::milliseconds(parse_number("--shutdown-grace", next()));
         } else if (flag == "--aof") {
             config.aof_path = next();
         } else if (flag == "--aof-sync") {
@@ -167,14 +186,31 @@ int main(int argc, char** argv) {
             std::cout << "  dashboard       : FAILED to bind (server still serving data)\n";
         }
     }
-    std::cout << "ready. press Ctrl-C to stop." << std::endl;
+    std::cout << "  shutdown grace  : " << config.shutdown_grace.count() << "ms\n"
+              << "ready. press Ctrl-C to stop." << std::endl;
 
     while (!g_stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    std::cout << "\nshutting down..." << std::endl;
+    std::cout << "\nshutting down: no longer accepting connections, draining in-flight "
+                 "requests (Ctrl-C again to quit immediately)..."
+              << std::endl;
+
+    const auto shutdown_started = std::chrono::steady_clock::now();
     server.stop();
+    const auto shutdown_took = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - shutdown_started);
+
+    if (server.drain_completed()) {
+        std::cout << "drained cleanly in " << shutdown_took.count() << "ms\n";
+    } else {
+        // Worth saying out loud: it means the grace period is too short, or a
+        // client stopped reading its replies.
+        std::cout << "grace period expired after " << shutdown_took.count()
+                  << "ms; force-closed " << server.forced_closed()
+                  << " connection(s) with work outstanding\n";
+    }
 
     const auto& metrics = server.metrics();
     std::cout << "served " << metrics.commands_total.load() << " commands across "

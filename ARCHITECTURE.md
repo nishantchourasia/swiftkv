@@ -196,7 +196,64 @@ worse than a memory leak: the process hits `RLIMIT_NOFILE` and can then accept
 *no* connection at all. Two owners would be worse still — the second close could
 sever an unrelated live connection whose descriptor number was reused.
 
-### 3.7 Shutdown ordering
+### 3.7 Graceful shutdown
+
+Stopping and stopping *gracefully* are different things. The naive version sets
+a flag, the loops exit, and every connection is dropped -- including clients
+that had sent a command and were waiting for the answer. Those clients get a
+closed socket and no reply, which is indistinguishable from a crash.
+
+Shutdown therefore runs in four phases:
+
+```
+ 1. stop accepting     join the acceptor, close the listener
+        │              no new connection can arrive
+        ▼
+ 2. drain              loops keep running; each connection gets a final read,
+        │              every command already received is answered, and the
+        │              reply is written out before the socket closes
+        ▼
+ 3. hard stop          when all loops report drained, or the grace expires
+        │
+        ▼
+ 4. flush and close    admin endpoint, then the log
+```
+
+Details that matter:
+
+**The acceptor exits on `draining_`, not `stopping_`.** Phase 1 joins that
+thread while only `draining_` is set; waiting for `stopping_` would deadlock,
+because `stopping_` is not set until phase 3 -- which never runs, because it is
+waiting for the join. This was a real bug, caught the first time shutdown was
+exercised.
+
+**Connections already accepted are drained, not discarded.** A connection can
+sit in a loop's handoff queue at the instant the acceptor stops. The client
+believes it is connected, so those are adopted and drained like any other.
+Discarding them was the first version, and it silently threw away work the
+server had already accepted.
+
+**A connection is only closed once a drain pass reads nothing new.** Closing
+after processing an empty inbox looked correct and was not: a client that sent
+a batch microseconds before the stop may not have had its bytes read yet, so
+"the inbox is empty" and "the client has finished talking" are different
+statements.
+
+**The grace period is bounded.** A client that requests a large value and then
+stops reading would otherwise hold shutdown open indefinitely. `drain_completed()`
+and `forced_closed()` report whether the deadline was hit, because that is the
+signal that the grace is too short or a client has stopped reading.
+
+**Readiness flips before the drain begins.** `running_` is cleared first, so
+`/ready` returns 503 for the whole drain: a load balancer stops sending new work
+while existing work finishes. `/health` keeps returning 200, because the process
+is alive and should not be restarted.
+
+**The log closes last**, after every loop has stopped, so nothing can append to
+a log being torn down. `close()` flushes and fsyncs, which is why a graceful
+stop loses nothing even with `sync=never`.
+
+### 3.8 Shutdown ordering
 
 ThreadSanitizer found this. `stop()` originally closed the listener and then
 joined the acceptor. Since the acceptor is the only thread that touches the
