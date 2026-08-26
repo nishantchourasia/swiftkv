@@ -250,17 +250,26 @@ around 380,000 ops/sec while latency grows roughly linearly and **the error rate
 stays at zero**. That is the behaviour you want: the server saturates and queues
 rather than collapsing or dropping requests.
 
-### Two things that turned out not to matter
+### Value size barely matters at these sizes
 
-Value size barely moves throughput between 16 bytes and 4 KB (409,411 vs
-392,900 ops/sec at 100 connections), so at these sizes the cost is per-request
-overhead, not moving bytes.
+Throughput moves little between 16-byte and 4 KB values (409,411 vs 392,900
+ops/sec at 100 connections), so the cost here is per-request overhead rather
+than moving bytes.
 
-Writes are slightly *faster* than reads (426,815 ops/sec at 0% reads vs 353,110
-at 100% reads). Not what most people would guess. The likely reason is that
-`SET` always finds its key while `GET` at a 20,000-key keyspace often misses and
-still pays the lookup — but that is a hypothesis, not something this benchmark
-isolates.
+### A claim this section used to make, now corrected
+
+This README previously reported that writes were *faster* than reads (426,815
+against 353,110 ops/sec) and offered a hypothesis about `GET` missing in a small
+keyspace.
+
+**A later, repeated measurement showed the opposite.** Reads are about 11%
+faster (473,289 against 424,749 ops/sec), consistently across five repeats with
+a 2.8% spread — and against a *larger* keyspace, where misses should have been
+more common, not less. The original figure came from a single unrepeated run and
+did not have the precision to support the claim built on it.
+
+Full detail, including the server-side memory and service-time data that
+explains why writes cost more, is in [BENCHMARK.md](BENCHMARK.md).
 
 ### What these numbers are not
 
@@ -270,6 +279,15 @@ therefore optimistic under saturation — the effect known as coordinated
 omission. Concurrency is swept across runs so the degradation curve is still
 visible. Client and server also share a host, so there is no real network in the
 path.
+
+### Full performance characterisation
+
+The numbers above were a first pass at 8 event loops. A later, more careful
+study — 170 runs, five repeats per configuration, medians with interquartile
+ranges, plus CPU and memory sampled from the server process — is in
+**[BENCHMARK.md](BENCHMARK.md)**. Its headline finding is that **the 8-loop
+configuration was the limit, not the design**: the same code reaches
+**1,635,084 ops/sec** with 64 event loops.
 
 ## 11. Results — reliability
 
@@ -307,8 +325,10 @@ does not.
 4. **Docker unverified.** No Docker daemon access on this machine, so the
    configuration is written but has never been built or run. It is not claimed
    to work.
-5. **Benchmarks are loopback-only,** on a machine simultaneously running 18
-   gem5 jobs. Real numbers, but not a clean lab.
+5. **Benchmarks are loopback-only,** on a shared machine also running gem5
+   simulation jobs. Real numbers, but not a clean lab. Server-side service time
+   is ~0.8 µs against ~20 µs observed by clients, so most of the round trip is
+   already syscall and scheduling overhead — a real network would add much more.
 6. **`fsync` is not proof against a power cut.** A drive with a volatile write
    cache can acknowledge before data reaches the platter. Testing that needs
    hardware this project does not have.

@@ -1,0 +1,18 @@
+# SwiftKV performance characterisation environment
+date            : 2026-08-26T13:26:12+05:30
+host            : Linux 6.8.0-107-generic x86_64
+cpu             : AMD EPYC 9754 128-Core Processor
+cores           : 512 logical
+memory          : 503 GB
+compiler        : g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+build           : Release (-O3)
+clock ticks/sec : 100
+loopback        : client and server on the same host (127.0.0.1)
+repeats         : 5 per configuration
+configurations  : 31
+gem5 jobs       : 5
+load average    : 4.10, 4.18, 4.29
+
+Note: background load differs between measurement sessions. Numbers
+here are comparable with each other, and should not be compared
+against runs recorded under a different load average.
