@@ -63,7 +63,7 @@ write one of these yourself:
 | Web dashboard (live, no hardcoded data) | ✅ Working |
 | Purpose-built benchmark client | ✅ Working |
 | **Multi-node cluster + replication** | ❌ **Not built yet** |
-| **Docker image** | ⚠️ Not verifiable here — no Docker daemon access on this machine |
+| **Docker image** | ❌ **Not written.** There is no Dockerfile in this repository |
 
 The last two are listed as missing rather than quietly omitted. See
 [Limitations](#12-limitations).
@@ -331,9 +331,9 @@ does not.
 1. **Single node.** SwiftKV is one process on one machine. There is no
    cluster, no replication and no consensus.
 2. **No authentication or TLS.** Bind to localhost.
-3. **Docker unverified.** No Docker daemon access on this machine, so the
-   configuration is written but has never been built or run. It is not claimed
-   to work.
+3. **No Docker support.** No Dockerfile has been written. The development
+   machine had no Docker daemon access either, so nothing could have been built
+   or verified there.
 4. **Benchmarks are loopback-only,** on a shared machine also running gem5
    simulation jobs. Real numbers, but not a clean lab. Server-side service time
    is ~0.8 µs against ~20 µs observed by clients, so most of the round trip is
