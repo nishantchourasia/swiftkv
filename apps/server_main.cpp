@@ -36,7 +36,7 @@ void on_signal(int) {
 }
 
 [[noreturn]] void usage(int code) {
-    std::cout << R"(swiftkv-server -- distributed key-value store
+    std::cout << R"(swiftkv-server -- single-node key-value store
 
 Usage: swiftkv-server [options]
 

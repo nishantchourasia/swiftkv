@@ -1,0 +1,34 @@
+# ---- Secrets: never commit ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_rsa
+credentials.json
+secrets/
+
+# ---- Logs & OS/editor noise ----
+logs/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# ---- C / C++ ----
+build/
+build-*/
+.perfdata/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.gcda
+*.gcno
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+__pycache__/
+*.py[cod]

@@ -1,6 +1,6 @@
 # SwiftKV
 
-A distributed key-value store written in C++20 — a TCP server, an event-driven
+A **single-node** key-value store written in C++20 — a TCP server, an event-driven
 network layer, a sharded concurrent store, and durable persistence.
 
 Think of it as a small Redis. It speaks Redis's own wire protocol, so the ideas
@@ -150,7 +150,18 @@ ctest --test-dir build --output-on-failure
 ```
 
 **Measured:** 212 test cases across 9 binaries, 57,981 assertions, all passing,
-in 2.77 seconds.
+in 2.77 seconds, on the machine described in §10.
+
+**One timing-sensitive test.** `byte counters move`
+(`tests/test_server.cpp:411`) asserts `bytes_written > 0` immediately after the
+client receives its reply, without waiting, so it can lose a race with the
+server thread that updates the counter. Re-measured on 2026-09-29 while the
+machine was heavily loaded (load average ~36), it failed in 74 of 100 isolated
+runs, and the unmodified original build failed 71 of 100 — so the behaviour
+predates any recent change. It passes reliably on an idle machine. The
+test reads the counter with no wait, which suggests an ordering race in the test
+rather than a server fault, but that has not been verified, and it is not yet
+fixed.
 
 | Suite | Cases | Covers |
 |-------|-------|--------|
@@ -317,22 +328,20 @@ Full output: [`docs/results/reliability_test.md`](docs/results/reliability_test.
 Stated plainly, because a portfolio that hides them is worth less than one that
 does not.
 
-1. **Single node.** There is no cluster and no replication yet. The name says
-   "distributed"; the code is not, yet.
+1. **Single node.** SwiftKV is one process on one machine. There is no
+   cluster, no replication and no consensus.
 2. **No authentication or TLS.** Bind to localhost.
-3. **No dashboard.** Metrics are exposed in Prometheus format but nothing
-   renders them.
-4. **Docker unverified.** No Docker daemon access on this machine, so the
+3. **Docker unverified.** No Docker daemon access on this machine, so the
    configuration is written but has never been built or run. It is not claimed
    to work.
-5. **Benchmarks are loopback-only,** on a shared machine also running gem5
+4. **Benchmarks are loopback-only,** on a shared machine also running gem5
    simulation jobs. Real numbers, but not a clean lab. Server-side service time
    is ~0.8 µs against ~20 µs observed by clients, so most of the round trip is
    already syscall and scheduling overhead — a real network would add much more.
-6. **`fsync` is not proof against a power cut.** A drive with a volatile write
+5. **`fsync` is not proof against a power cut.** A drive with a volatile write
    cache can acknowledge before data reaches the platter. Testing that needs
    hardware this project does not have.
-7. **No TTL/expiry, no data types beyond strings**, no transactions, no pub/sub.
+6. **No TTL/expiry, no data types beyond strings**, no transactions, no pub/sub.
 
 ## 13. Future work
 
@@ -343,9 +352,8 @@ In the order they would add most:
    replica needs to consume.
 2. **Cluster with key-space partitioning** — consistent hashing across nodes,
    which turns the existing shard concept into a cross-machine one.
-3. **A dashboard** over the existing `/metrics` output.
-4. **TTL and expiry.**
-5. **An open-loop benchmark mode** to measure latency at a fixed arrival rate
+3. **TTL and expiry.**
+4. **An open-loop benchmark mode** to measure latency at a fixed arrival rate
    and remove coordinated omission.
 
 ## 14. Screenshots
@@ -358,6 +366,33 @@ benchmark output, reproduced in §10 from committed CSVs.
 Not deployed. It binds to localhost and has no authentication, so putting it on
 a public address would be irresponsible. To try it, build and run it locally —
 [RUNBOOK.md](RUNBOOK.md) takes about two minutes.
+
+## 16. Project structure
+
+```
+swiftkv/
+├── apps/
+│   ├── server_main.cpp      the server daemon
+│   └── bench_main.cpp       purpose-built benchmark client
+├── include/swiftkv/         public headers: lru, store, protocol, commands,
+│                            server, net, persistence, latency, admin, client
+├── src/                     implementations (plus the embedded dashboard page)
+├── tests/                   Catch2 suites, one per component (9 binaries)
+├── scripts/
+│   ├── run_load_test.sh         concurrency sweep -> docs/results/
+│   ├── run_reliability_test.sh  SIGKILL crash-recovery scenarios
+│   └── perf_matrix.py           repeated-run performance characterisation
+├── docs/results/            committed raw CSVs and environment records
+├── third_party/catch2/      vendored test framework (single header)
+├── ARCHITECTURE.md  BENCHMARK.md  RUNBOOK.md  SECURITY.md  TESTING.md  INTERVIEW.md
+└── CMakeLists.txt
+```
+
+## 17. License
+
+No license has been selected for this repository yet, so no license file is
+included. Note that `third_party/catch2/catch.hpp` is Catch2, vendored under its
+own licence.
 
 ---
 

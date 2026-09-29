@@ -285,8 +285,7 @@ where it actually breaks rather than guessing.
 
 ### 27. What is the biggest weakness?
 
-It is called SwiftKV and described as distributed, but it runs on one node.
-There is no replication and no cluster yet. Everything below that — the store,
+SwiftKV is a single-node store. There is no replication and no cluster yet. Everything below that — the store,
 the protocol, the log — is built so that replication is the natural next step,
 but it is not written, and the README lists it as missing rather than implying
 otherwise.
