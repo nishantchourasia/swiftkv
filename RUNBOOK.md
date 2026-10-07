@@ -354,10 +354,26 @@ compact either. This is a known gap.
 
 ## STEP 12 — Docker
 
-⚠️ **Docker configuration for SwiftKV has not been written yet, and cannot be
-verified on this machine** — the account is not in the `docker` group and there
-is no sudo to add it. When it is added it will be marked unverified, because
-claiming a build works when it has never been run would be dishonest.
+On Windows with Docker Desktop installed, from the `swiftkv` directory:
+
+```powershell
+.\start-swiftkv.cmd
+```
+
+This starts Docker Desktop when needed, builds the image, starts SwiftKV and
+waits for `/ready`. Open http://localhost:6381 for the dashboard. The database
+listens on localhost:6380. Both published ports are restricted to loopback.
+
+```powershell
+docker compose ps
+docker compose logs --tail 50
+docker compose stop
+```
+
+Data lives in the `swiftkv-local_swiftkv-data` named volume. Container restart
+or replacement preserves it; `docker compose down --volumes` deletes it.
+Use `scripts/test-docker.ps1` for the local protocol and persistence smoke test.
+This is a single-node setup, without replication.
 
 ---
 

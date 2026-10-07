@@ -6,6 +6,43 @@ network layer, a sharded concurrent store, and durable persistence.
 Think of it as a small Redis. It speaks Redis's own wire protocol, so the ideas
 transfer directly.
 
+## Run with Docker on Windows — one command
+
+From the portfolio workspace (`Project_Mtech`), run:
+
+```powershell
+.\placement-portfolio-local\swiftkv\start-swiftkv.cmd
+```
+
+The launcher starts Docker Desktop if necessary, builds the Linux image and
+waits until SwiftKV is healthy. Docker Desktop must already be installed and
+configured for Linux containers. The first build needs internet access; later
+builds reuse the cache. No host C++ compiler or Node installation is required.
+
+- Dashboard: http://localhost:6381
+- RESP database: `localhost:6380`
+- Data: named volume `swiftkv-local_swiftkv-data`, with append-only persistence
+  (`everysec`). Normal stops and container replacement preserve data. A sudden
+  crash can lose recent writes before the periodic sync.
+
+After the first launch, starting Docker Desktop also restarts this container
+unless you explicitly stopped it. The dashboard remains a monitoring UI.
+This setup runs one node; Docker does not add clustering or replication.
+
+From the `swiftkv` directory:
+
+```powershell
+docker compose logs --tail 50
+docker compose stop
+.\start-swiftkv.cmd
+# Optional smoke + restart/recreation persistence check:
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-docker.ps1
+```
+
+The test restarts this local SwiftKV container and creates/removes one unique
+test key. Stop it first if you are using it for an active workload. Do not use
+`docker compose down --volumes` unless you intend to delete saved data.
+
 **Every number on this page was measured by running the code.** The commands
 that produced them are given, and the raw output is committed under
 [`docs/results/`](docs/results/).
@@ -63,9 +100,9 @@ write one of these yourself:
 | Web dashboard (live, no hardcoded data) | ✅ Working |
 | Purpose-built benchmark client | ✅ Working |
 | **Multi-node cluster + replication** | ❌ **Not built yet** |
-| **Docker image** | ❌ **Not written.** There is no Dockerfile in this repository |
+| **Docker image + Compose** | ✅ Built and verified locally; one-command Windows launcher, healthcheck and persistent volume |
 
-The last two are listed as missing rather than quietly omitted. See
+Multi-node clustering and replication remain unimplemented. See
 [Limitations](#12-limitations).
 
 ## 4. Architecture
@@ -331,9 +368,8 @@ does not.
 1. **Single node.** SwiftKV is one process on one machine. There is no
    cluster, no replication and no consensus.
 2. **No authentication or TLS.** Bind to localhost.
-3. **No Docker support.** No Dockerfile has been written. The development
-   machine had no Docker daemon access either, so nothing could have been built
-   or verified there.
+3. **Local Docker setup only.** The image and Compose setup are verified on
+   Docker Desktop. This is not a production deployment or a multi-node cluster.
 4. **Benchmarks are loopback-only,** on a shared machine also running gem5
    simulation jobs. Real numbers, but not a clean lab. Server-side service time
    is ~0.8 µs against ~20 µs observed by clients, so most of the round trip is

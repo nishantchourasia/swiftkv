@@ -1,0 +1,25 @@
+name: swiftkv-local
+services:
+  swiftkv:
+    image: swiftkv:local
+    build: .
+    ports:
+      - "127.0.0.1:6380:6380"
+      - "127.0.0.1:6381:6381"
+    volumes:
+      - swiftkv-data:/data
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:6381/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+volumes:
+  swiftkv-data:

@@ -1,0 +1,8 @@
+*
+!CMakeLists.txt
+!include/**
+!src/**
+!apps/**
+!tests/**
+!third_party/**
+!Dockerfile

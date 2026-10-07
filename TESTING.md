@@ -25,12 +25,39 @@ running the command shown.
 | Load tests | ✅ **RUN** — results recorded | `./scripts/run_load_test.sh` |
 | Stress tests | ✅ **RUN** — to 4,000 connections | `docs/results/stress_test.csv` |
 | Security tests | ⚠️ **PARTIAL** — protocol-level only | see §6 |
-| End-to-end tests | ❌ **NOT APPLICABLE** — no UI |
+| Dashboard browser smoke test | ✅ **PASSED** — live running status, no JavaScript errors (2026-10-07) |
 | Fuzz testing | ❌ **NOT RUN** |
 | Multi-node / replication tests | ❌ **NOT APPLICABLE** — feature does not exist |
-| Docker tests | ❌ **BLOCKED** — no Docker daemon access |
+| Docker smoke tests | ✅ **PASSED** — image build, health, RESP commands, restart/recreation persistence (2026-10-07) |
 
 **Totals: 212 test cases across 9 binaries, 57,981 assertions, 2.77 seconds.**
+
+These totals describe the historical full C++ suite, not the Docker smoke run.
+
+### Local Docker verification — 2026-10-07
+
+Verified on Windows with Docker Desktop (Linux engine), Docker 29.7.2 and
+Compose 5.5.0. The image builds both `swiftkv-server` and `swiftkv-bench`.
+
+```powershell
+.\start-swiftkv.cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-docker.ps1
+docker compose exec -T swiftkv id
+```
+
+- Clean image build and Compose healthcheck passed.
+- After stopping Docker Desktop, the same launcher started it and returned a
+  healthy SwiftKV container using the cached build (exit code 0).
+- PING, SET, GET, EXISTS, DEL and missing-key reply passed over real TCP.
+- A unique test value survived normal container restart and forced container
+  replacement with the same named volume. The test removed its own key.
+- HTTP health and dashboard HTML passed. A headless Chrome check rendered the
+  dashboard, observed the live `running` status and found no JavaScript errors.
+- Runtime identity is non-root UID/GID 10001; both ports publish on loopback.
+
+This verifies local container packaging and graceful restart recovery, not
+power-loss durability, replication, or production deployment. The full C++
+suite and historical load benchmarks were not rerun for this packaging change.
 
 ---
 
